@@ -103,6 +103,7 @@ class ComputationGraph:
         self.id_dict: dict[str, int] = {}
         self.node_set: set[int] = set()
         self.edge_list: list[tuple[COMPUTATION_NODES, COMPUTATION_NODES]] = []
+        self.input_tensor_ids: set[int] = set()
 
         # module node  to capture whole graph
         main_container_module = ModuleNode(Identity(), -1)
@@ -135,10 +136,78 @@ class ComputationGraph:
         '''Records all edges in self.edge_list to
         the graphviz graph using node ids from edge_list'''
         edge_counter: dict[tuple[int, int], int] = {}
+
+        only_input_tensor_path = True
+
+        visible_ids = self.input_tensor_ids
+        in_count = {}
+        queue = list(visible_ids)
+        dict_edges = {}
+        can_be_vis = {}
+
+        import torch.distributed as dist
+        if dist.get_rank() == 0:
+            with open('debug.log', 'a') as f:
+                print(visible_ids, file=f)
+
+        for node in queue:
+            can_be_vis[node] = True
+
         for tail, head in self.edge_list:
+            if dist.get_rank() == 0:
+                with open('debug.log', 'a') as f:
+                    print(tail.name, head.name, file=f)
+                    print(tail.node_id, head.node_id, file=f)
+                    print(self.id_dict[tail.node_id], self.id_dict[head.node_id], file=f)
+            if tail.node_id not in dict_edges:
+                dict_edges[tail.node_id] = []
+            dict_edges[tail.node_id].append(head.node_id)
+            if head.node_id not in in_count:
+                in_count[head.node_id] = 1
+            else:
+                in_count[head.node_id] += 1
+
+        for tail, head in self.edge_list:
+            if tail.node_id not in in_count and tail.node_id not in visible_ids:
+                queue.append(tail.node_id)
+                can_be_vis[tail.node_id] = False
+
+        while len(queue):
+            top = queue.pop(0)
+            if top not in dict_edges:
+                continue
+            for c in dict_edges[top]:
+                in_count[c] -= 1
+                if c not in can_be_vis:
+                    can_be_vis[c] = False
+                can_be_vis[c] |= can_be_vis[top]
+                if in_count[c] == 0:
+                    assert c not in visible_ids
+                    visible_ids.add(c)
+                    queue.append(c)
+
+        for e in list(visible_ids):
+            if e in can_be_vis and not can_be_vis[e]:
+                visible_ids.remove(e)
+
+        for tail, head in self.edge_list:
+            if only_input_tensor_path and tail.node_id not in visible_ids:
+                continue
             edge_id = self.id_dict[tail.node_id], self.id_dict[head.node_id]
             edge_counter[edge_id] = edge_counter.get(edge_id, 0) + 1
             self.add_edge(edge_id, edge_counter[edge_id])
+
+        if only_input_tensor_path:
+            graph_ids = set()
+            for id in visible_ids:
+                graph_ids.add(self.id_dict[id])
+            delete_ids = []
+            for i in range(len(self.visual_graph.body)):
+                id_like = self.visual_graph.body[i].split()[0]
+                if id_like.isdigit() and int(id_like) not in graph_ids:
+                    delete_ids.append(i)
+            for i in delete_ids[::-1]:
+                del self.visual_graph.body[i]
 
     def traverse_graph(
         self, action_fn: Callable[..., None], **kwargs: Any
@@ -178,7 +247,7 @@ class ComputationGraph:
             ) as cur_cont:
                 if display_nested:
                     cur_cont.attr(
-                        style='dashed', label=k.name, labeljust='l', fontsize='12'
+                        style='dashed', label=k.name + ':' + k.module_type, labeljust='l', fontsize='12'
                     )
                     new_kwargs = updated_dict(new_kwargs, 'subgraph', cur_cont)
                 for g in v:
@@ -191,6 +260,8 @@ class ComputationGraph:
         in graphviz graph)'''
 
         cur_node = kwargs['cur_node']
+        if cur_node.name == 'input-tensor':
+            self.input_tensor_ids.add(cur_node.node_id)
         # if tensor node is traced, dont repeat collecting
         # if node is isolated, dont record it
         is_isolated = cur_node.is_root() and cur_node.is_leaf()
@@ -265,6 +336,8 @@ class ComputationGraph:
     def is_node_visible(self, compute_node: COMPUTATION_NODES) -> bool:
         '''Returns True if node should be displayed on the visual
         graph. Otherwise False'''
+
+        print(compute_node.name)
 
         assert_input_type(
             'is_node_visible', (TensorNode, ModuleNode, FunctionNode,), compute_node
@@ -380,7 +453,7 @@ class ComputationGraph:
                 label = f'''<
                     <TABLE BORDER="{border}" CELLBORDER="{cell_bor}"
                     CELLSPACING="{cell_sp}" CELLPADDING="{cell_pad}">
-                        <TR><TD>{node.name}<BR/>depth:{node.depth}</TD><TD>{node.tensor_shape}</TD></TR>
+                        <TR><TD>{node.name}<BR/>depth:{node.depth}</TD><TD>{node.tensor_shape} {node.dtype}</TD></TR>
                     </TABLE>>'''
             else:
                 input_repr = compact_list_repr(node.input_shape)
@@ -389,13 +462,13 @@ class ComputationGraph:
                     <TABLE BORDER="{border}" CELLBORDER="{cell_bor}"
                     CELLSPACING="{cell_sp}" CELLPADDING="{cell_pad}">
                     <TR>
-                        <TD ROWSPAN="2">{node.name}<BR/>depth:{node.depth}</TD>
+                        <TD ROWSPAN="2">{node.name}<BR/>depth:{node.depth}{node.module_type}</TD>
                         <TD COLSPAN="2">{input_str}:</TD>
-                        <TD COLSPAN="2">{input_repr} </TD>
+                        <TD COLSPAN="2">{input_repr} {node.input_extra_msg} </TD>
                     </TR>
                     <TR>
                         <TD COLSPAN="2">{output_str}: </TD>
-                        <TD COLSPAN="2">{output_repr} </TD>
+                        <TD COLSPAN="2">{output_repr} {node.output_extra_msg} </TD>
                     </TR>
                     </TABLE>>'''
         else:

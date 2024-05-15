@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Iterable, Mapping, TypeVar
 from collections.abc import Callable
+import functools
 
 import torch
 from torch import nn
@@ -15,6 +16,7 @@ from .utils import OrderedSet
 
 # Needed for module wrapper and resetting
 _orig_module_forward = torch.nn.Module.__call__
+_orig_autograd_apply = torch.autograd.Function.apply
 
 
 # Functions below are torch.tensor creation operations
@@ -38,15 +40,21 @@ class Recorder:
     to record them in computation graph'''
     def __init__(
         self, orig_mod_forward: Callable[..., Any], new_mod_forward: Callable[..., Any],
+        orig_autograd_apply: Callable[..., Any], new_autograd_apply: Callable[..., Any],
         model_graph: ComputationGraph
     ) -> None:
         self.orig_module_forward = orig_mod_forward
         self.new_module_forward = new_mod_forward
+        self.orig_autograd_apply= orig_autograd_apply
+        self.new_autograd_apply = new_autograd_apply
         self.model_graph = model_graph
 
     def __enter__(self) -> None:
         setattr(
             torch.nn.Module, "__call__", self.new_module_forward
+        )
+        setattr(
+            torch.autograd.Function, "apply", self.new_autograd_apply
         )
 
         for name, op in zip(orig_name_list, _orig_op_list):
@@ -58,6 +66,9 @@ class Recorder:
         # reset module __call__ back to original method and torch creation ops
         setattr(
             torch.nn.Module, "__call__", self.orig_module_forward
+        )
+        setattr(
+            torch.autograd.Function, "apply", self.orig_autograd_apply
         )
 
         for name, op in zip(orig_name_list, _orig_op_list):
@@ -89,6 +100,17 @@ def creation_ops_wrapper(
     return _func
 
 
+def autograd_apply_wrapper() -> Callable[..., Any]:
+    '''Wrapper for autograd functions apply'''
+    @classmethod
+    def _autograd_apply_wrapper(cls: torch.autograd.Function, *args: Any, **kwargs: Any) -> Any:
+        func = functools.partial(_orig_autograd_apply.__func__, cls)
+        func.__name__ = cls.__name__
+        return RecorderTensor.__torch_function__(func, [RecorderTensor], args, kwargs)
+
+    return _autograd_apply_wrapper
+
+
 def module_forward_wrapper(model_graph: ComputationGraph) -> Callable[..., Any]:
     '''Wrapper for forward functions of modules'''
     def _module_forward_wrapper(mod: nn.Module, *args: Any, **kwargs: Any) -> Any:
@@ -116,8 +138,12 @@ def module_forward_wrapper(model_graph: ComputationGraph) -> Callable[..., Any]:
             mod, cur_depth, input_nodes,  # type: ignore[arg-type]
             name=type(mod).__name__
         )
+        if len(list(mod.parameters())):
+            gauss_mdtype = str(next(mod.parameters()).dtype)
+        else:
+            gauss_mdtype = ""
         cur_node.set_input_shape(
-            reduce_data_info([args, kwargs], collect_shape, [])
+            reduce_data_info([args, kwargs], collect_shape, []), str(reduce_data_info([args, kwargs], collect_dtype, [])), gauss_mdtype
         )
 
         # update context with current modules's context
@@ -171,7 +197,7 @@ def module_forward_wrapper(model_graph: ComputationGraph) -> Callable[..., Any]:
             cur_node.add_output_nodes(output_node)
             output_node.context = input_context
 
-        cur_node.set_output_shape(reduce_data_info(out, collect_shape, []))
+        cur_node.set_output_shape(reduce_data_info(out, collect_shape, []), str(reduce_data_info(out, collect_dtype, [])))
         return out
 
     return _module_forward_wrapper
@@ -274,9 +300,9 @@ class RecorderTensor(torch.Tensor):
         # you cant use this before output computation since shape calls
         # to another torch_function (infinite recursion)
         cur_node.set_input_shape(
-            reduce_data_info([args, kwargs], collect_shape, [])
+            reduce_data_info([args, kwargs], collect_shape, []), str(reduce_data_info([args, kwargs], collect_dtype, []))
         )
-        cur_node.set_output_shape(reduce_data_info(out, collect_shape, []))
+        cur_node.set_output_shape(reduce_data_info(out, collect_shape, []), str(reduce_data_info(out, collect_dtype, [])))
 
         return out
 
@@ -433,6 +459,12 @@ def collect_shape(
     recorded_data: RecorderTensor, collected: list[tuple[int, ...]]
 ) -> None:
     collected.append(tuple(recorded_data.shape))
+
+
+def collect_dtype(
+    recorded_data: RecorderTensor, collected: list[str, ...]
+) -> None:
+    collected.append(str(recorded_data.dtype))
 
 
 def process_output_node(

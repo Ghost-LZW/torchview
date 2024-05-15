@@ -16,6 +16,7 @@ from .computation_graph import ComputationGraph
 from .computation_node import TensorNode
 from .recorder_tensor import (
     module_forward_wrapper, _orig_module_forward, RecorderTensor,
+    autograd_apply_wrapper, _orig_autograd_apply,
     reduce_data_info, collect_tensor_node, Recorder
 
 )
@@ -250,7 +251,8 @@ def forward_prop(
                 f"Specified model mode not recognized: {mode}"
             )
         new_module_forward = module_forward_wrapper(model_graph)
-        with Recorder(_orig_module_forward, new_module_forward, model_graph):
+        new_autograd_apply = autograd_apply_wrapper()
+        with Recorder(_orig_module_forward, new_module_forward, _orig_autograd_apply, new_autograd_apply, model_graph):
             with torch.no_grad():
                 if isinstance(x, (list, tuple)):
                     _ = model.to(device)(*x, **kwargs)

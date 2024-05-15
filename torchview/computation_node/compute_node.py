@@ -32,6 +32,7 @@ class TensorNode(Node):
         )
         self.tensor_id = id(tensor)
         self.tensor_shape = tuple(tensor.shape)
+        self.dtype = str(tensor.dtype).split('.')[-1]
         self.name = name
         self.is_aux = is_aux
         self.main_node = self if main_node is None else main_node
@@ -70,13 +71,19 @@ class ModuleNode(Node):
         self.input_shape: list[Tuple[int, ...]] = []
         self.output_shape: list[Tuple[int, ...]] = []
         self.output_nodes = NodeContainer() if output_nodes is None else output_nodes
+        self.input_extra_msg = None
+        self.output_extra_msg = None
+        self.module_type = None
         self.set_node_id()
 
-    def set_input_shape(self, input_shape: list[Tuple[int, ...]]) -> None:
+    def set_input_shape(self, input_shape: list[Tuple[int, ...]], msg, mtype) -> None:
         self.input_shape = input_shape
+        self.input_extra_msg = msg.replace('torch.', '')
+        self.module_type = mtype.replace('torch.', '')
 
-    def set_output_shape(self, output_shape: list[Tuple[int, ...]]) -> None:
+    def set_output_shape(self, output_shape: list[Tuple[int, ...]], msg) -> None:
         self.output_shape = output_shape
+        self.output_extra_msg = msg.replace('torch.', '')
 
     def add_output_nodes(self, output_node: Node) -> None:
         self.output_nodes.add(output_node)
@@ -120,12 +127,17 @@ class FunctionNode(Node):
         self.output_shape: list[Tuple[int, ...]] = []
         self.set_node_id()
         self.output_nodes = self.children
+        self.input_extra_msg = None
+        self.output_extra_msg = None
+        self.module_type = ""
 
-    def set_input_shape(self, input_shape: list[Tuple[int, ...]]) -> None:
+    def set_input_shape(self, input_shape: list[Tuple[int, ...]], msg) -> None:
         self.input_shape = input_shape
+        self.input_extra_msg = msg.replace('torch.', '')
 
-    def set_output_shape(self, output_shape: list[Tuple[int, ...]]) -> None:
+    def set_output_shape(self, output_shape: list[Tuple[int, ...]], msg) -> None:
         self.output_shape = output_shape
+        self.output_extra_msg = msg.replace('torch.', '')
 
     def add_output_nodes(self, output_node: Node) -> None:
         self.output_nodes.add(output_node)
